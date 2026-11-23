@@ -1,0 +1,122 @@
+# Nextcloud for Velydock. Started by ./vdp up with an .env generated from plugin.toml, the
+# instance and Velydock's own .env – do not run it by hand without that file.
+#
+#   app    Nextcloud (Apache). Joins Velydock's network under the alias ${APP_ALIAS}: Traefik
+#          routes ${APP_HOST} there, Keycloak sends back-channel logouts there, and Nextcloud
+#          reaches Keycloak's internal address for tokens and keys.
+#   cron   background jobs every five minutes
+#   db     PostgreSQL, only on the private network of this instance
+#   redis  file locking and cache, likewise
+
+x-logging: &logging
+  driver: json-file
+  options: {max-size: "10m", max-file: "5"}
+
+x-nextcloud-env: &nextcloud-env
+  POSTGRES_HOST: db
+  POSTGRES_DB: nextcloud
+  POSTGRES_USER: nextcloud
+  POSTGRES_PASSWORD: ${DB_PASSWORD:?}
+  REDIS_HOST: redis
+  REDIS_HOST_PASSWORD: ${REDIS_PASSWORD:?}
+
+services:
+  app:
+    image: ${NEXTCLOUD_IMAGE:?}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      <<: *nextcloud-env
+      NEXTCLOUD_ADMIN_USER: ${ADMIN_USER:?}
+      NEXTCLOUD_ADMIN_PASSWORD: ${ADMIN_PASSWORD:?}
+      NEXTCLOUD_TRUSTED_DOMAINS: ${APP_HOST} ${APP_HOST}${PUBLIC_PORT_SUFFIX} ${APP_ALIAS}
+      TRUSTED_PROXIES: 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7
+      OVERWRITEPROTOCOL: https
+      OVERWRITEHOST: ${APP_HOST}${PUBLIC_PORT_SUFFIX}
+      OVERWRITECLIURL: ${APP_URL}
+      PHP_UPLOAD_LIMIT: ${PHP_UPLOAD_LIMIT}
+      PHP_MEMORY_LIMIT: ${PHP_MEMORY_LIMIT}
+      APACHE_DISABLE_REWRITE_IP: "1"
+      # Read by hooks/before-starting/10-velydock.sh
+      VDP_VELYDOCK_URL: ${VELYDOCK_URL}
+      VDP_OIDC_CLIENT_ID: ${OIDC_CLIENT_ID}
+      VDP_OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET}
+      VDP_OIDC_DISCOVERY_URL: ${OIDC_DISCOVERY_URL}
+      VDP_OIDC_SCOPE: ${OIDC_SCOPE}
+      VDP_ORG: ${ORG}
+      VDP_UID_CLAIM: ${UID_CLAIM}
+      VDP_DEFAULT_PHONE_REGION: ${DEFAULT_PHONE_REGION}
+    volumes:
+      - nextcloud:/var/www/html
+      - ./hooks/before-starting:/docker-entrypoint-hooks.d/before-starting:ro
+      - ./nextcloud-app/velydock_embed:/opt/vdp/velydock_embed:ro
+    healthcheck:
+      test: ["CMD", "php", "-r", "exit(str_contains((string)@file_get_contents('http://127.0.0.1/status.php'), '\"installed\":true') ? 0 : 1);"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      # The first start installs Nextcloud and fetches user_oidc: several minutes.
+      start_period: 600s
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    networks:
+      backend: {}
+      velydock:
+        aliases: ["${APP_ALIAS}"]
+
+  cron:
+    image: ${NEXTCLOUD_IMAGE:?}
+    restart: unless-stopped
+    logging: *logging
+    entrypoint: /cron.sh
+    environment: *nextcloud-env
+    volumes:
+      - nextcloud:/var/www/html
+    depends_on:
+      app: {condition: service_healthy}
+    networks: [backend, velydock]
+
+  db:
+    image: ${POSTGRES_IMAGE:?}
+    restart: unless-stopped
+    logging: *logging
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U nextcloud -d nextcloud"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - db:/var/lib/postgresql
+    networks: [backend]
+
+  redis:
+    image: ${REDIS_IMAGE:?}
+    restart: unless-stopped
+    logging: *logging
+    security_opt: ["no-new-privileges:true"]
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?}", "--save", ""]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+    networks: [backend]
+
+volumes:
+  nextcloud:
+  db:
+
+networks:
+  backend:
+    internal: true
+  velydock:
+    name: ${VELYDOCK_NETWORK:?}
+    external: true

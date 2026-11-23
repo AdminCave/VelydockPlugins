@@ -1,0 +1,12 @@
+# Copy to vdp.toml (not in Git). Without it vdp assumes a production installation in ../Velydock.
+
+[velydock]
+# Velydock checkout with its .env (relative to this directory or absolute).
+dir = "../Velydock"
+env_file = ".env"
+# Compose project name of Velydock: its network is "<project>_edge".
+project = "velydock"
+
+# Development stack of Velydock (scripts/dev-stack.sh):
+# env_file = ".env.dev"
+# project = "velydock-dev"

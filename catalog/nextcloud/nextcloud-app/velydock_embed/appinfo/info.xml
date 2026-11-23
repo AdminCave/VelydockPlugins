@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<info xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:noNamespaceSchemaLocation="https://apps.nextcloud.com/schema/apps/info.xsd">
+    <id>velydock_embed</id>
+    <name>Velydock Embed</name>
+    <summary>Allows Velydock to show this Nextcloud in its workspace.</summary>
+    <description>Adds the addresses in the app setting frame_ancestors (space separated) to the CSP frame-ancestors of every page. Managed by VelydockPlugins.</description>
+    <version>1.0.0</version>
+    <licence>agpl</licence>
+    <author>AdminCave</author>
+    <namespace>VelydockEmbed</namespace>
+    <category>integration</category>
+    <dependencies>
+        <nextcloud min-version="30" max-version="40"/>
+    </dependencies>
+</info>

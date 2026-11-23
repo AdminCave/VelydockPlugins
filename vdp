@@ -1,0 +1,543 @@
+#!/usr/bin/env python3
+"""vdp – ready-made apps for Velydock.
+
+A *plugin* is a template in catalog/<plugin>/: a Compose file, a Traefik route and a manifest
+(plugin.toml). An *instance* is one installation of a plugin under its own host name, kept in
+instances/<instance>/ (not in Git: it holds secrets). One plugin can run as many instances, for
+example one Nextcloud per organization.
+
+    ./vdp catalog                                      what can be installed
+    ./vdp add nextcloud cloud --host cloud.example.com [--org acme] [--set KEY=VALUE ...]
+    ./vdp up cloud                                     Keycloak client, route, containers
+    ./vdp status                                       all instances
+    ./vdp down cloud                                   stop, take the route away, keep the data
+    ./vdp remove cloud [--purge]                       also delete the Keycloak client (and data)
+
+Only the Python standard library is needed (3.11 or newer) and Docker with Compose.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent
+CATALOG = ROOT / "catalog"
+INSTANCES = ROOT / "instances"
+TOOLS = ROOT / "tools"
+CONFIG_FILE = Path(os.environ.get("VDP_CONFIG", ROOT / "vdp.toml"))
+
+NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}[a-z0-9]$")
+HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
+KEYCLOAK_REALM = "velydock"
+KEYCLOAK_INTERNAL_URL = "http://keycloak:8080"
+HELPER_IMAGE = "python:3.13-alpine"
+
+
+class VdpError(Exception):
+    pass
+
+
+# --- Velydock installation ------------------------------------------------------------------------
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+@dataclass
+class Velydock:
+    dir: Path
+    env: dict[str, str]
+    project: str
+
+    @classmethod
+    def load(cls) -> Velydock:
+        config: dict[str, Any] = {}
+        if CONFIG_FILE.exists():
+            config = tomllib.loads(CONFIG_FILE.read_text()).get("velydock", {})
+        directory = (ROOT / config.get("dir", "../Velydock")).resolve()
+        env_file = directory / config.get("env_file", ".env")
+        if not env_file.exists():
+            raise VdpError(
+                f"{env_file} not found. Point vdp.toml at your Velydock installation "
+                "(see vdp.example.toml)."
+            )
+        env = read_env_file(env_file)
+        for key in ("VELYDOCK_HOST", "KEYCLOAK_HOST", "VELYDOCK_IDP_ADMIN_CLIENT_SECRET"):
+            if not env.get(key):
+                raise VdpError(f"{key} is not set in {env_file}.")
+        return cls(directory, env, config.get("project", "velydock"))
+
+    @property
+    def suffix(self) -> str:
+        return self.env.get("PUBLIC_PORT_SUFFIX", "")
+
+    @property
+    def url(self) -> str:
+        return f"https://{self.env['VELYDOCK_HOST']}{self.suffix}"
+
+    @property
+    def issuer(self) -> str:
+        return f"https://{self.env['KEYCLOAK_HOST']}{self.suffix}/realms/{KEYCLOAK_REALM}"
+
+    @property
+    def network(self) -> str:
+        # Traefik, Velydock and Keycloak share this network. Apps join it under an alias.
+        return f"{self.project}_edge"
+
+    @property
+    def route_dir(self) -> Path:
+        # Traefik watches exactly this directory (file provider); see Velydock's docker-compose.yml.
+        return self.dir / "deploy" / "traefik" / "dynamic"
+
+    @property
+    def tls(self) -> str:
+        # Same default as Velydock's Compose file: unset means Let's Encrypt, empty means none.
+        resolver = self.env.get("TLS_RESOLVER", "letsencrypt")
+        return f"{{certResolver: {resolver}}}" if resolver else "{}"
+
+
+# --- Catalog and instances ------------------------------------------------------------------------
+
+
+@dataclass
+class Plugin:
+    name: str
+    dir: Path
+    manifest: dict[str, Any]
+
+    @classmethod
+    def load(cls, name: str) -> Plugin:
+        directory = CATALOG / name
+        manifest_file = directory / "plugin.toml"
+        if not manifest_file.exists():
+            raise VdpError(f"No plugin '{name}' in {CATALOG}. See ./vdp catalog.")
+        return cls(name, directory, tomllib.loads(manifest_file.read_text()))
+
+    @classmethod
+    def all(cls) -> list[Plugin]:
+        return [cls.load(p.parent.name) for p in sorted(CATALOG.glob("*/plugin.toml"))]
+
+    @property
+    def title(self) -> str:
+        return str(self.manifest.get("title", self.name))
+
+
+@dataclass
+class Instance:
+    name: str
+    data: dict[str, Any]
+
+    @property
+    def dir(self) -> Path:
+        return INSTANCES / self.name
+
+    @property
+    def plugin(self) -> Plugin:
+        return Plugin.load(self.data["plugin"])
+
+    @property
+    def project(self) -> str:
+        return f"vdp-{self.name}"
+
+    @property
+    def alias(self) -> str:
+        return f"vdp-{self.name}"
+
+    @property
+    def client_id(self) -> str:
+        return f"vdp-{self.name}"
+
+    @property
+    def route_file_name(self) -> str:
+        return f"vdp-{self.name}.yml"
+
+    @classmethod
+    def load(cls, name: str) -> Instance:
+        path = INSTANCES / name / "instance.json"
+        if not path.exists():
+            raise VdpError(f"No instance '{name}'. See ./vdp status.")
+        return cls(name, json.loads(path.read_text()))
+
+    @classmethod
+    def all(cls) -> list[Instance]:
+        return [cls.load(p.parent.name) for p in sorted(INSTANCES.glob("*/instance.json"))]
+
+    def save(self) -> None:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        (self.dir / "instance.json").write_text(json.dumps(self.data, indent=2) + "\n")
+
+    def secrets(self) -> dict[str, str]:
+        path = self.dir / "secrets.env"
+        return read_env_file(path) if path.exists() else {}
+
+    def variables(self, velydock: Velydock) -> dict[str, str]:
+        """Everything the Compose file, the route template and the hooks may use."""
+        plugin = self.plugin
+        host = self.data["host"]
+        org = self.data.get("org") or ""
+        scopes = ["openid", "profile", "email"] + ([f"organization:{org}"] if org else [])
+        route = plugin.manifest.get("route", {})
+        values = {str(k): str(v) for k, v in plugin.manifest.get("defaults", {}).items()}
+        values.update(self.data.get("settings", {}))
+        values.update(self.secrets())
+        values.update(
+            {
+                "VDP_INSTANCE": self.name,
+                "APP_HOST": host,
+                "APP_URL": f"https://{host}{velydock.suffix}",
+                "APP_ALIAS": self.alias,
+                "APP_INTERNAL_URL": f"http://{self.alias}:{route.get('port', 80)}",
+                "PUBLIC_PORT_SUFFIX": velydock.suffix,
+                "VELYDOCK_URL": velydock.url,
+                "VELYDOCK_NETWORK": velydock.network,
+                "KEYCLOAK_ISSUER": velydock.issuer,
+                "KEYCLOAK_INTERNAL_URL": KEYCLOAK_INTERNAL_URL,
+                # Keycloak answers server-to-server calls on its internal address and still puts
+                # the public issuer into tokens (KC_HOSTNAME_BACKCHANNEL_DYNAMIC in Velydock), so
+                # apps never need to reach the public host name of Keycloak from inside.
+                "OIDC_DISCOVERY_URL": f"{KEYCLOAK_INTERNAL_URL}/realms/{KEYCLOAK_REALM}"
+                "/.well-known/openid-configuration",
+                "OIDC_CLIENT_ID": self.client_id,
+                "OIDC_SCOPE": " ".join(scopes),
+                "ORG": org,
+                "TLS": velydock.tls,
+            }
+        )
+        return values
+
+
+def render(template: str, values: dict[str, str]) -> str:
+    """Replace %%NAME%% – a syntax that neither YAML, Traefik's Go templates nor regexes use."""
+
+    def replace(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key not in values:
+            raise VdpError(f"Template uses %%{key}%%, which is not defined.")
+        return values[key]
+
+    return re.sub(r"%%([A-Z0-9_]+)%%", replace, template)
+
+
+def write_private(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+    os.chmod(path, 0o600)
+
+
+def env_text(values: dict[str, str]) -> str:
+    lines = ["# Generated by ./vdp up – do not edit; change instance.json or use ./vdp set."]
+    for key, value in sorted(values.items()):
+        if "\n" in value:
+            raise VdpError(f"{key} contains a line break.")
+        # Compose interpolates $ in .env values unless they are single-quoted.
+        lines.append(f"{key}='{value}'" if "'" not in value else f"{key}={value}")
+    return "\n".join(lines) + "\n"
+
+
+# --- Docker, Compose, Keycloak --------------------------------------------------------------------
+
+
+def run(cmd: list[str], *, env: dict[str, str] | None = None, input: str | None = None,
+        check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        cmd, env={**os.environ, **(env or {})}, input=input, text=True,
+        capture_output=capture,
+    )
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip() if capture else ""
+        raise VdpError(f"Command failed ({result.returncode}): {' '.join(cmd[:4])} …\n{detail}")
+    return result
+
+
+def compose(instance: Instance, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    plugin = instance.plugin
+    return run(
+        [
+            "docker", "compose",
+            "-p", instance.project,
+            "--project-directory", str(plugin.dir),
+            "-f", str(plugin.dir / "compose.yml"),
+            "--env-file", str(instance.dir / ".env"),
+            *args,
+        ],
+        check=check,
+    )
+
+
+def keycloak(velydock: Velydock, action: str, spec: dict[str, Any]) -> dict[str, Any]:
+    """Run tools/keycloak_client.py in a throwaway container on Velydock's network.
+
+    Keycloak's admin API is not reachable from outside (by design), so the call goes from
+    inside, with Velydock's own service account (it holds manage-clients in the realm).
+    """
+    script = (TOOLS / "keycloak_client.py").read_text()
+    result = run(
+        [
+            "docker", "run", "--rm", "-i", "--network", velydock.network,
+            "-e", "KC_URL", "-e", "KC_REALM", "-e", "KC_ADMIN_SECRET", "-e", "KC_SPEC",
+            HELPER_IMAGE, "python", "-", action,
+        ],
+        env={
+            "KC_URL": KEYCLOAK_INTERNAL_URL,
+            "KC_REALM": KEYCLOAK_REALM,
+            "KC_ADMIN_SECRET": velydock.env["VELYDOCK_IDP_ADMIN_CLIENT_SECRET"],
+            "KC_SPEC": json.dumps(spec),
+        },
+        input=script,
+        capture=True,
+    )
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def oidc_client_spec(instance: Instance, values: dict[str, str]) -> dict[str, Any]:
+    oidc = instance.plugin.manifest.get("oidc", {})
+    app_url = values["APP_URL"]
+    spec: dict[str, Any] = {
+        "clientId": instance.client_id,
+        "name": f"{instance.plugin.title} ({instance.name})",
+        "secret": values["OIDC_CLIENT_SECRET"],
+        "rootUrl": app_url,
+        "baseUrl": "/",
+        "redirectUris": [app_url + p for p in oidc.get("redirect_paths", ["/*"])],
+        "postLogoutRedirectUris": [app_url + p for p in oidc.get("post_logout_paths", ["/*"])],
+        "pkce": bool(oidc.get("pkce", False)),
+        "organizationScope": bool(values["ORG"]),
+    }
+    if path := oidc.get("backchannel_logout_path"):
+        # Over Velydock's network, not the public address: Keycloak reaches the app directly.
+        spec["backchannelLogoutUrl"] = values["APP_INTERNAL_URL"] + path
+    return spec
+
+
+# --- Commands -------------------------------------------------------------------------------------
+
+
+def cmd_catalog(_: argparse.Namespace) -> None:
+    for plugin in Plugin.all():
+        print(f"{plugin.name:<16} {plugin.title} – {plugin.manifest.get('description', '')}")
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    plugin = Plugin.load(args.plugin)
+    name, host = args.instance, args.host.lower()
+    if not NAME_RE.match(name):
+        raise VdpError("Instance names: 3–32 characters, a–z, 0–9 and '-', starting with a letter.")
+    if not HOST_RE.match(host):
+        raise VdpError(f"'{host}' is not a host name (no scheme, no path, no port).")
+    if (INSTANCES / name).exists():
+        raise VdpError(f"Instance '{name}' exists already.")
+    velydock = Velydock.load()
+    taken = {velydock.env.get(k) for k in ("VELYDOCK_HOST", "KEYCLOAK_HOST", "SANDBOX_HOST",
+                                           "APPS_HOST")}
+    taken |= {i.data["host"] for i in Instance.all()}
+    if host in taken:
+        raise VdpError(f"{host} is already used by Velydock or another instance.")
+    if args.org and not re.match(r"^[a-z0-9][a-z0-9-]*$", args.org):
+        raise VdpError("--org takes the short name (alias) of the organization.")
+
+    defaults = plugin.manifest.get("defaults", {})
+    settings = {}
+    for item in args.set or []:
+        key, _, value = item.partition("=")
+        if key not in defaults:
+            raise VdpError(f"{plugin.name} has no setting {key}. Known: {', '.join(defaults)}")
+        settings[key] = value
+
+    instance = Instance(name, {"plugin": plugin.name, "host": host, "org": args.org or "",
+                               "settings": settings})
+    instance.save()
+    generated = {key: secrets.token_urlsafe(32)
+                 for key in ["OIDC_CLIENT_SECRET", *plugin.manifest.get("secrets", [])]}
+    write_private(instance.dir / "secrets.env",
+                  "# Generated by ./vdp add. Keep private, include in backups.\n"
+                  + "".join(f"{k}={v}\n" for k, v in generated.items()))
+    print(f"Instance '{name}' of {plugin.title} created in {instance.dir}.")
+    print(f"Point DNS for {host} to the Velydock server, then: ./vdp up {name}")
+    if not velydock.env["VELYDOCK_HOST"].split(".", 1)[-1] == host.split(".", 1)[-1]:
+        print(f"Note: {host} and {velydock.env['VELYDOCK_HOST']} differ in their parent domain. "
+              "Embedding only works reliably under the same registrable domain "
+              "(Velydock docs/anwendungsintegration.md).")
+
+
+def cmd_set(args: argparse.Namespace) -> None:
+    instance = Instance.load(args.instance)
+    defaults = instance.plugin.manifest.get("defaults", {})
+    for item in args.pairs:
+        key, _, value = item.partition("=")
+        if key not in defaults:
+            raise VdpError(f"No setting {key}. Known: {', '.join(defaults)}")
+        instance.data.setdefault("settings", {})[key] = value
+    instance.save()
+    print(f"Saved. Apply with ./vdp up {instance.name}")
+
+
+def cmd_up(args: argparse.Namespace) -> None:
+    instance = Instance.load(args.instance)
+    plugin = instance.plugin
+    velydock = Velydock.load()
+    values = instance.variables(velydock)
+
+    if run(["docker", "network", "inspect", velydock.network], check=False,
+           capture=True).returncode != 0:
+        raise VdpError(f"Docker network {velydock.network} not found – is Velydock running "
+                       f"(project '{velydock.project}')?")
+
+    write_private(instance.dir / ".env", env_text(values))
+
+    if plugin.manifest.get("oidc"):
+        print(f"→ Keycloak: client {instance.client_id}")
+        keycloak(velydock, "ensure", oidc_client_spec(instance, values))
+
+    print(f"→ Containers ({instance.project})")
+    compose(instance, "up", "-d", "--wait", "--quiet-pull", "--remove-orphans")
+
+    # The route comes last: Traefik only sends traffic once the app answers.
+    template = plugin.dir / "route.yml"
+    route = render(template.read_text(), values)
+    target = velydock.route_dir / instance.route_file_name
+    target.write_text(route)
+    target.chmod(0o644)
+    print(f"→ Route {target}")
+
+    app = plugin.manifest.get("velydock_app", {})
+    print()
+    print(f"{plugin.title} runs at {values['APP_URL']}")
+    if app:
+        print("Add it in Velydock once (Verwaltung → Apps → Neue App):")
+        print(f"  Name: {app.get('name', plugin.title)}   Typ: {app.get('type_label', 'Eingebettet')}")
+        print(f"  Adresse: {values['APP_URL']}{app.get('path', '/')}   Symbol: {app.get('icon', '')}")
+        for line in app.get("notes", []):
+            print(f"  {render(line, values)}")
+
+
+def cmd_down(args: argparse.Namespace) -> None:
+    instance = Instance.load(args.instance)
+    velydock = Velydock.load()
+    (velydock.route_dir / instance.route_file_name).unlink(missing_ok=True)
+    if (instance.dir / ".env").exists():
+        compose(instance, "down")
+    print(f"'{instance.name}' stopped; its data is kept.")
+
+
+def cmd_remove(args: argparse.Namespace) -> None:
+    instance = Instance.load(args.instance)
+    velydock = Velydock.load()
+    (velydock.route_dir / instance.route_file_name).unlink(missing_ok=True)
+    if (instance.dir / ".env").exists():
+        compose(instance, "down", *(["--volumes"] if args.purge else []))
+    if instance.plugin.manifest.get("oidc"):
+        keycloak(velydock, "delete", {"clientId": instance.client_id})
+        print(f"Keycloak client {instance.client_id} deleted.")
+    if args.purge:
+        shutil.rmtree(instance.dir)
+        print(f"'{instance.name}' removed with all its data.")
+    else:
+        print(f"'{instance.name}' removed; data volumes and {instance.dir} are kept "
+              "(--purge deletes them).")
+
+
+def cmd_status(_: argparse.Namespace) -> None:
+    instances = Instance.all()
+    if not instances:
+        print("No instances yet. ./vdp catalog, then ./vdp add <plugin> <name> --host <host>")
+        return
+    try:
+        route_dir: Path | None = Velydock.load().route_dir
+    except VdpError:
+        route_dir = None
+    for instance in instances:
+        result = run(["docker", "compose", "-p", instance.project, "ps", "--format", "json"],
+                     check=False, capture=True)
+        states = []
+        for line in result.stdout.splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            states.append(f"{row.get('Service')}:{row.get('Health') or row.get('State')}")
+        routed = route_dir is not None and (route_dir / instance.route_file_name).exists()
+        org = f" org={instance.data['org']}" if instance.data.get("org") else ""
+        print(f"{instance.name:<16} {instance.data['plugin']:<12} {instance.data['host']}{org}"
+              f"  route={'on' if routed else 'off'}  {' '.join(states) or 'stopped'}")
+
+
+def cmd_compose(args: argparse.Namespace) -> None:
+    instance = Instance.load(args.instance)
+    if not (instance.dir / ".env").exists():
+        raise VdpError(f"Run ./vdp up {instance.name} first.")
+    compose(instance, *args.args, check=False)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="vdp", description="Ready-made apps for Velydock.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("catalog", help="list the plugins that can be installed").set_defaults(
+        func=cmd_catalog)
+
+    p = sub.add_parser("add", help="create an instance of a plugin")
+    p.add_argument("plugin")
+    p.add_argument("instance", help="name of this installation, e.g. cloud or cloud-acme")
+    p.add_argument("--host", required=True, help="public host name of the app")
+    p.add_argument("--org", help="restrict sign-in to this Velydock organization (short name)")
+    p.add_argument("--set", action="append", metavar="KEY=VALUE", help="override a default")
+    p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("set", help="change settings of an instance")
+    p.add_argument("instance")
+    p.add_argument("pairs", nargs="+", metavar="KEY=VALUE")
+    p.set_defaults(func=cmd_set)
+
+    for name, func, text in (("up", cmd_up, "create or update: Keycloak client, containers, route"),
+                             ("down", cmd_down, "stop and remove the route, keep data")):
+        p = sub.add_parser(name, help=text)
+        p.add_argument("instance")
+        p.set_defaults(func=func)
+
+    p = sub.add_parser("remove", help="stop, delete the Keycloak client; --purge: data as well")
+    p.add_argument("instance")
+    p.add_argument("--purge", action="store_true")
+    p.set_defaults(func=cmd_remove)
+
+    sub.add_parser("status", help="all instances").set_defaults(func=cmd_status)
+
+    p = sub.add_parser("compose", help="run docker compose for an instance (logs, exec, ps …)")
+    p.add_argument("instance")
+    p.add_argument("args", nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_compose)
+
+    args = parser.parse_args(argv)
+    try:
+        args.func(args)
+    except VdpError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

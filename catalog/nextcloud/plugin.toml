@@ -1,0 +1,42 @@
+# Nextcloud with sign-in through Velydock's Keycloak, embedded in the Velydock workspace.
+title = "Nextcloud"
+description = "Dateien, Kalender, Kontakte – Anmeldung über Velydock (Keycloak), eingebettet im Workspace"
+
+# Generated once by ./vdp add, kept in instances/<name>/secrets.env.
+# OIDC_CLIENT_SECRET is always generated for plugins with an [oidc] table.
+secrets = ["DB_PASSWORD", "REDIS_PASSWORD", "ADMIN_PASSWORD"]
+
+# Settings an instance may change: ./vdp add … --set KEY=VALUE, or ./vdp set <instance> KEY=VALUE
+[defaults]
+NEXTCLOUD_IMAGE = "nextcloud:35-apache"
+POSTGRES_IMAGE = "postgres:18-alpine"
+REDIS_IMAGE = "redis:8-alpine"
+ADMIN_USER = "ncadmin"
+PHP_UPLOAD_LIMIT = "16G"
+PHP_MEMORY_LIMIT = "1G"
+DEFAULT_PHONE_REGION = "DE"
+# Nextcloud user ID taken from this claim. preferred_username = the Velydock user name.
+UID_CLAIM = "preferred_username"
+
+[route]
+# Compose service that joins Velydock's network under the alias vdp-<instance>.
+service = "app"
+port = 80
+
+[oidc]
+# user_oidc's callback, with and without pretty URLs.
+redirect_paths = ["/index.php/apps/user_oidc/code", "/apps/user_oidc/code"]
+post_logout_paths = ["/*"]
+# user_oidc sends a PKCE challenge; Keycloak then insists on it.
+pkce = true
+# Keycloak tells Nextcloud directly when someone signs out of Velydock or is locked.
+backchannel_logout_path = "/index.php/apps/user_oidc/backchannel-logout/velydock"
+
+[velydock_app]
+name = "Nextcloud"
+type_label = "Eingebettet"
+icon = "Wolke / Dateien"
+path = "/"
+notes = [
+  "Lokaler Notfall-Admin: %%ADMIN_USER%% – Passwort in instances/%%VDP_INSTANCE%%/secrets.env, Anmeldung über %%APP_URL%%/login?direct=1",
+]

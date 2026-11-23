@@ -1,0 +1,30 @@
+# Written by VelydockPlugins (./vdp up %%VDP_INSTANCE%%) – removed by ./vdp down. Do not edit.
+http:
+  routers:
+    vdp-%%VDP_INSTANCE%%:
+      rule: "Host(`%%APP_HOST%%`)"
+      entryPoints: [websecure]
+      service: vdp-%%VDP_INSTANCE%%
+      middlewares: [vdp-%%VDP_INSTANCE%%-headers, vdp-%%VDP_INSTANCE%%-dav]
+      tls: %%TLS%%
+
+  middlewares:
+    vdp-%%VDP_INSTANCE%%-headers:
+      headers:
+        # Nextcloud allows framing by Velydock itself (velydock_embed adds Velydock's address to
+        # its CSP frame-ancestors). X-Frame-Options cannot name another origin – drop it.
+        customResponseHeaders:
+          X-Frame-Options: ""
+        stsSeconds: 15552000
+    vdp-%%VDP_INSTANCE%%-dav:
+      # CalDAV/CardDAV discovery for phones and desktop clients.
+      redirectRegex:
+        regex: "^https://([^/]+)/\\.well-known/(card|cal)dav"
+        replacement: "https://${1}/remote.php/dav/"
+        permanent: true
+
+  services:
+    vdp-%%VDP_INSTANCE%%:
+      loadBalancer:
+        servers:
+          - url: "%%APP_INTERNAL_URL%%"
